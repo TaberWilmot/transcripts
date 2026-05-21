@@ -1,0 +1,121 @@
+name: SOTS Transcript Scrape
+
+"on":
+  schedule:
+    - cron: '0 6 * * 0'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install --upgrade yt-dlp youtube-transcript-api
+
+      - name: Run scrape
+        run: |
+          python3 << 'PYEOF'
+          import re
+          import subprocess
+          import sys
+          from pathlib import Path
+          from youtube_transcript_api import YouTubeTranscriptApi
+          from youtube_transcript_api._errors import (
+              IpBlocked, NoTranscriptFound, PoTokenRequired,
+              RequestBlocked, TranscriptsDisabled,
+              VideoUnavailable, VideoUnplayable,
+          )
+          from youtube_transcript_api.formatters import TextFormatter
+
+          CHANNEL_URL = "https://www.youtube.com/@ScienceoftheStrike"
+          OUT_DIR = Path("transcripts")
+          ARCHIVE = OUT_DIR / ".archive.txt"
+
+          def safe(s): return re.sub(r"[^\w\-]+", "_", s).strip("_")[:80]
+
+          OUT_DIR.mkdir(exist_ok=True)
+          done = set()
+          if ARCHIVE.exists():
+              done = {ln.strip() for ln in ARCHIVE.read_text().split("\n") if ln.strip()}
+          print(f"Archive: {len(done)} previously scraped")
+
+          r = subprocess.run(
+              ["yt-dlp", "--flat-playlist",
+               "--print", "%(id)s\t%(title)s\t%(upload_date)s",
+               CHANNEL_URL],
+              capture_output=True, text=True, check=False,
+          )
+          if r.returncode != 0:
+              print("yt-dlp enumeration failed:", r.stderr, file=sys.stderr)
+              sys.exit(1)
+
+          videos = []
+          for line in r.stdout.strip().split("\n"):
+              parts = line.split("\t")
+              if len(parts) >= 2 and parts[0]:
+                  date = parts[2] if len(parts) >= 3 and parts[2] not in ("NA", "") else "00000000"
+                  videos.append({"id": parts[0], "title": parts[1], "date": date})
+          print(f"Channel: {len(videos)} videos found\n")
+
+          api = YouTubeTranscriptApi()
+          fmt = TextFormatter()
+          new, skipped, no_caps, blocked, errors = 0, 0, 0, 0, 0
+
+          for v in videos:
+              if v["id"] in done:
+                  skipped += 1
+                  continue
+              fname = f"{v['date']}-{safe(v['title'])}-{v['id']}.txt"
+              fpath = OUT_DIR / fname
+              try:
+                  fetched = api.fetch(v["id"], languages=["en", "en-US"])
+                  text = fmt.format_transcript(fetched)
+                  header = (f"# {v['title']}\n# Video ID: {v['id']}\n"
+                            f"# Upload date: {v['date']}\n"
+                            f"# Source: https://www.youtube.com/watch?v={v['id']}\n\n")
+                  fpath.write_text(header + text)
+                  done.add(v["id"])
+                  new += 1
+                  print(f"  OK  {fname}")
+              except (NoTranscriptFound, TranscriptsDisabled):
+                  no_caps += 1
+                  done.add(v["id"])
+                  print(f"  --  no captions: {v['id']}")
+              except (RequestBlocked, IpBlocked, PoTokenRequired) as e:
+                  blocked += 1
+                  print(f"  XX  BLOCKED ({type(e).__name__}): {v['id']}")
+              except (VideoUnavailable, VideoUnplayable) as e:
+                  errors += 1
+                  print(f"  !!  unavailable ({type(e).__name__}): {v['id']}")
+              except Exception as e:
+                  errors += 1
+                  print(f"  !!  {type(e).__name__}: {v['id']} - {e}")
+
+          ARCHIVE.write_text("\n".join(sorted(done)) + "\n")
+          print(f"\nDone. new={new} skipped={skipped} "
+                f"no_captions={no_caps} blocked={blocked} errors={errors}")
+
+          if blocked > 0 and new == 0:
+              print("\nALL blocked by YouTube bot detection. "
+                    "Need cookies or proxy fallback.", file=sys.stderr)
+              sys.exit(2)
+          PYEOF
+
+      - name: Commit and push
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add transcripts/
+          git diff --cached --quiet || git commit -m "Auto-update transcripts $(date -u +%F)"
+          git push
